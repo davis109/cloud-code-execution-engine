@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Distributed Code Execution Engine - Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: code-executor
+    Description: Project name for resource naming
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+Resources:
+  # ============================================================================
+  # DynamoDB Table - Job Results Storage
+  # ============================================================================
+  ExecutionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-executions'
+      BillingMode: PAY_PER_REQUEST  # On-demand pricing (Free Tier: 25 GB storage)
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # SQS Queue - Job Queue
+  # ============================================================================
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-jobs'
+      VisibilityTimeout: 30  # Must be >= max execution time
+      MessageRetentionPeriod: 345600  # 4 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3  # Retry 3 times before DLQ
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Dead Letter Queue for failed jobs
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # IAM Roles
+  # ============================================================================
+  
+  # Lambda Execution Role (Producer)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueUrl
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt ExecutionsTable.Arn
+
+  # EC2 Worker Role
+  EC2WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SQSDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ExecutionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ec2/${ProjectName}:*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-instance-profile'
+      Roles:
+        - !Ref EC2WorkerRole
+
+  # ============================================================================
+  # Security Groups
+  # ============================================================================
+  
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-worker-sg'
+      GroupDescription: Security group for code execution worker
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # IMPORTANT: Restrict to your IP in production
+          Description: SSH access for administration
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS API calls
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # VPC Configuration (Free Tier Compatible)
+  # ============================================================================
+  
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================================
+  # EC2 Worker Instance
+  # ============================================================================
+  
+  WorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro  # Free tier eligible
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref WorkerSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Update system
+          yum update -y
+          yum install -y docker python3-pip git
+          
+          # Start Docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -aG docker ec2-user
+          
+          # Install boto3
+          pip3 install boto3
+          
+          # Create app directory
+          mkdir -p /opt/code-executor
+          cd /opt/code-executor
+          
+          # Set environment variables
+          cat > /opt/code-executor/.env << 'EOF'
+          SQS_QUEUE_URL=${JobQueue}
+          DYNAMODB_TABLE=${ExecutionsTable}
+          AWS_REGION=${AWS::Region}
+          EOF
+          
+          # Download worker script (you'll need to upload to S3 or use GitHub)
+          # For demo, create placeholder
+          echo "# Worker script will be deployed here" > /opt/code-executor/executor.py
+          
+          # Create systemd service
+          cat > /etc/systemd/system/code-executor.service << 'SERVICE'
+          [Unit]
+          Description=Code Execution Worker
+          After=network.target docker.service
+          Requires=docker.service
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/opt/code-executor
+          EnvironmentFile=/opt/code-executor/.env
+          ExecStart=/usr/bin/python3 /opt/code-executor/executor.py
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          
+          # Create log file
+          mkdir -p /var/log
+          touch /var/log/code-executor.log
+          chown ec2-user:ec2-user /var/log/code-executor.log
+          
+          # Enable service (will start after manual script upload)
+          systemctl daemon-reload
+          systemctl enable code-executor
+          
+          echo "Worker instance setup complete!"
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-worker'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Lambda Functions
+  # ============================================================================
+  
+  ProducerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-producer'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref JobQueue
+          DYNAMODB_TABLE: !Ref ExecutionsTable
+      Code:
+        ZipFile: |
+          # Placeholder - upload actual code via console or AWS CLI
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': 'Deploy actual producer code'
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-status'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ExecutionsTable
+      Code:
+        ZipFile: |
+          # Placeholder - upload actual code via console or AWS CLI
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': 'Deploy actual status checker code'
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # API Gateway
+  # ============================================================================
+  
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - '*'
+
+  ApiIntegrationProducer:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ProducerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiIntegrationStatus:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt StatusCheckerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiRouteExecute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /execute'
+      Target: !Sub 'integrations/${ApiIntegrationProducer}'
+
+  ApiRouteStatus:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'GET /status/{job_id}'
+      Target: !Sub 'integrations/${ApiIntegrationStatus}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: prod
+      AutoDeploy: true
+
+  LambdaInvokePermissionProducer:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProducerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  LambdaInvokePermissionStatus:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StatusCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint'
+
+  SQSQueueUrl:
+    Description: SQS Queue URL
+    Value: !Ref JobQueue
+    Export:
+      Name: !Sub '${ProjectName}-queue-url'
+
+  DynamoDBTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref ExecutionsTable
+    Export:
+      Name: !Sub '${ProjectName}-table-name'
+
+  WorkerInstanceId:
+    Description: EC2 Worker Instance ID
+    Value: !Ref WorkerInstance
+
+  WorkerPublicIP:
+    Description: EC2 Worker Public IP
+    Value: !GetAtt WorkerInstance.PublicIp
+
+  SSHCommand:
+    Description: SSH command to connect to worker
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${WorkerInstance.PublicIp}'
