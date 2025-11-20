@@ -1,0 +1,25 @@
+[Unit]
+Description=Code Execution Worker Service
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/code-executor
+Environment="SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/637423410497/code-executor-jobs"
+Environment="DYNAMODB_TABLE=code-executor-executions"
+Environment="AWS_DEFAULT_REGION=us-east-1"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 /opt/code-executor/executor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
